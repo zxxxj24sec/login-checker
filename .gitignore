@@ -1,0 +1,15 @@
+# === 敏感凭据文件 —— 绝不提交 ===
+# 批量检测结果/账号密码清单（ncepu.edu.cn.txt、tongji.edu.cn.txt 等）
+*.txt
+*.csv
+
+# === 开发记录（.workbuddy 里含真实站点与账号）===
+.workbuddy/
+
+# === Python 缓存 ===
+__pycache__/
+*.py[cod]
+
+# === IDE ===
+.idea/
+.vscode/
