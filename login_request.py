@@ -8,15 +8,27 @@
   2. 批量检测：--file 指向一个文本文件，每行一条 "url:username:password"
 
 【判定规则】（按优先级从高到低）
+  0. 页面要求验证码/二次验证（验证码/滑块/短信/recaptcha 等特征词）→ 验证码
+     （**最高优先级**，脚本无法自动完成，转入「需人工复核」文档单独输出，
+      不进成功清单、也不判失败）
   1. 接口明确返回认证失败（JSON 非 0 业务码 / success=false / HTTP 401·403）→ 失败
   2. 登录失败特征词存在（密码错误 / 认证失败 / login failed …）→ 失败
   3. 跳回登录页 / 跳到 CAS 统一认证页 → 失败
-  4. 有 token/session（凭据本身就是证据，可叠加跳转证据）→ 成功
+  4. 有强会话凭据（auth_token / access_token / login_token / jwt 等，凭据本身就是证据，
+     可叠加跳转证据）→ 成功
   5. 登录表单消失 + 出现登录后元素（退出登录/我的账户/dashboard …）→ 成功
      （必须对照匿名基线：匿名页有表单且现在没了、且该元素匿名页没有）
   6. 实质跳转到登录后页面 → 成功
-  7. 兜底：登录前后页面内容相似度 ≤80%（变化明显）→ 成功，否则失败
+  7. 兜底：登录前后页面内容相似度 ≤80%（变化明显）→ 成功；
+     相似度 >80%（内容未变）→ 异常（不武断判失败，避免漏掉正确密码，留待人工复核）
 其余 → 异常（无明确证据，保守不判成功）。
+
+  验证码条目单独写文档：<根域名>_captcha.txt，与成功文档 <根域名>.txt 分开，
+  供人工复核，绝不与成功账密混在一起。
+
+  * 「强会话凭据」≠ 通用会话 Cookie。ASPSESSIONIDxxxx / ASP.NET_SessionId / JSESSIONID /
+    PHPSESSID / sessionid / sid 这类通用会话标识**匿名访问就会下发**，登录失败时也下发，
+    一律不作为成功证据（只有 auth_token / access_token / login_token / jwt 等才算）。
 
 三条防误判的核心约束（都踩过坑，别回退）：
   * JS 跳转（window.location / document.location / location.replace）不单独作为成功
@@ -30,7 +42,8 @@
     因此要求：匿名页确有表单、且该元素匿名页没有；拿不到基线则不启用这条规则。
 
 成功不再靠"页面上有欢迎语"这类单薄字眼；要看页面文字请用
---check-contains / --success-contains 显式指定。
+--check-contains（验证页文字）或 --success-contains（登录响应文字，命中即成功、
+未命中不判失败）显式指定。
 密码为空的条目会直接跳过（空密码登录成功几乎必然是误判）。
 退出码：单条 0=成功 1=失败 2=请求异常；批量 0=全部成功 1=存在失败/异常 2=参数错误。
 
@@ -77,6 +90,19 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 # ---------- 特征词 ----------
+# 验证码特征词：出现在响应里即归入「需人工复核」类别，单独输出、不进成功清单。
+# 注意：验证码是**最高优先级**——一旦页面要求验证码/滑块/短信/二次验证，脚本无法自动
+# 完成，无论后续是否出现"登录后元素"或"会话凭据"，都不能判成功（那些极可能是验证码
+# 页面自带的干扰元素），一律转入人工复核文档。
+CAPTCHA_WORDS = [
+    "验证码", "验证码输入", "请输入验证码", "输入验证码", "图形验证码", "图片验证码",
+    "短信验证码", "手机验证码", "动态验证码", "滑动验证", "滑块验证", "拖动验证",
+    "拖动滑块", "请完成验证", "完成验证", "人机验证", "安全验证", "校验码",
+    "captcha", "captchaimage", "verifycode", "verification code", "verification_code",
+    "image code", "imgcode", "check code", "checkcode", "slide verify", "slider",
+    "security code", "securitycode", "recaptcha", "geetest", "hcaptcha",
+]
+
 # 失败特征词：出现在响应里即判失败。
 FAIL_WORDS = [
     "密码错误", "账号或密码错误", "用户名或密码错误", "账号不存在", "用户不存在", "账号已锁定",
@@ -97,9 +123,17 @@ POST_LOGIN_ELEMENTS = [
 ]
 
 # ---------- Cookie 分级 ----------
-STRONG_COOKIE_PAT = re.compile(r"token|jwt|sessionid|sid|uid|user_?id|auth|login|remember|bearer|credential", re.I)
-WEAK_COOKIES = {"jsessionid", "phpsessid", "aspsessionid", "asp.net_sessionid",
-                "laravel_session", "ci_session", "session", "_session", "csrftoken", "xsrf-token"}
+# 强凭据：仅当 Cookie 名整体以这些词为核心时才算。注意 sessionid/sid 不能作为强凭据——
+# ASP 的 ASPSESSIONIDxxxx、JSP 的 JSESSIONID、PHP 的 PHPSESSID 都是「匿名访问就下发」的
+# 通用会话标识，登录失败时也会下发，绝不能当作登录成功证据。
+STRONG_COOKIE_PAT = re.compile(r"^(?:.*_)?(?:auth_?token|access_?token|refresh_?token|jwt|"
+                               r"login_?token|sid$|session_?token|token$)", re.I)
+# 通用会话 Cookie：用「前缀/精确」匹配，优先级高于强凭据正则。
+# ASPSESSIONIDxxxx / ASP.NET_SessionId / JSESSIONID / PHPSESSID 等都归这里。
+WEAK_COOKIE_PAT = re.compile(
+    r"^(?:aspsessionid|asp\.net_sessionid|jsessionid|phpsessid|"
+    r"laravel_session|ci_session|ci_session_id|session$|_session$|"
+    r"csrftoken|csrf_?token|xsrf-?token|sessid|sid$)", re.I)
 COOKIE_ATTRS = {"path", "domain", "expires", "max-age", "secure", "httponly", "samesite", "priority", "partitioned"}
 
 # ---------- 页面 / URL 特征 ----------
@@ -162,11 +196,17 @@ def _cookie_names_from_headers(raw):
 
 
 def _classify_cookies(cookies):
+    """把 Cookie 分成 (strong, weak)。
+
+    关键顺序：先判定「通用会话 Cookie」——ASPSESSIONIDxxx / JSESSIONID / PHPSESSID 这类
+    匿名访问就会下发的标识，必须归 weak，绝不能因名字里碰巧含 sessionid/sid 而进 strong。
+    """
     strong, weak = [], []
     for c in cookies:
-        if c.lower() in WEAK_COOKIES:
+        name = c.lower()
+        if WEAK_COOKIE_PAT.search(name):
             weak.append(c)
-        elif STRONG_COOKIE_PAT.search(c):
+        elif STRONG_COOKIE_PAT.search(name):
             strong.append(c)
         else:
             weak.append(c)
@@ -212,7 +252,7 @@ def _json_evidence(text):
             continue
         if val == 0 or 200 <= val < 300:
             return True, f"JSON 业务码 {k}={val}（0/2xx 视为成功）"
-        return False, f"JSON 业务码 {k}={val}（非 0 视为失败码；若贵系统约定不同，请用 --success-contains 指定）"
+        return False, f"JSON 业务码 {k}={val}（非 0 视为失败码；若贵系统约定不同，请用 --fail-contains 指定）"
 
     for k in ("status", "result", "state"):
         v = data.get(k)
@@ -436,33 +476,43 @@ def extract_form_fields(html):
 # 判定
 # --------------------------------------------------------------------------- #
 def judge_login_response(r, login_url, success_contains=None, fail_contains=None, anon=None):
-    """分析登录接口响应，返回 (verdict, reason, info)，verdict ∈ {success, fail, unknown}。
+    """分析登录接口响应，返回 (verdict, reason, info)，verdict ∈ {success, fail, unknown, captcha}。
 
     判定优先级（从高到低）：
+      0. 页面要求验证码/二次验证（验证码/滑块/短信/recaptcha 等特征词）→ captcha
+         （**最高优先级**，需人工复核，单独输出、不进成功清单）
       1. 显式 --fail-contains 命中 → 失败
       2. 接口明确返回认证失败（JSON 非 0 业务码 / success=false / HTTP 401·403·其他 4xx·5xx）
       3. 登录失败特征词（密码错误 / 认证失败 / login failed …）
-      4. 显式 --success-contains（命中即成功，未命中即失败）
+      4. 显式 --success-contains 命中 → 成功；**未命中不判定失败，继续按后续规则判断**
       5. 被重定向回登录页 → 失败
       6. 脚本跳转到 CAS / 统一身份认证登录页（caslogin/authserver/passport）→ 失败
-      7. 有 token/session 且「实质跳转」到登录后页面 → 成功
-      8. 有 token/session 且脚本跳转（非静态）→ 成功
-      9. 有 token/session（凭据本身就是证据，不依赖跳转）→ 成功
+      7. 有强会话凭据且「实质跳转」到登录后页面 → 成功
+      8. 有强会话凭据且脚本跳转（非静态）→ 成功
+      9. 有强会话凭据（凭据本身就是证据，不依赖跳转）→ 成功
      10. 登录表单消失 + 出现登录后元素 → 成功（**必须能拿到匿名基线**：
           匿名页有表单且现在没了、且该元素匿名页没有，才算有效；拿不到基线则不启用）
      11. 响应仍是登录表单 → 失败
      12. 实质跳转到登录后页面（且匿名访问不会落到同一地址）→ 成功
      13. 无凭据的 JS 跳转 → 目标含 login/error/fail/cas 判失败，其余一律 unknown
-     14. 仅通用 Cookie（JSESSIONID 等）→ unknown
+     14. 仅通用会话 Cookie（ASPSESSIONIDxxxx/JSESSIONID/PHPSESSID 等）→ unknown
       其余 → unknown。
 
-    两条防误判的核心约束（踩过坑，别回退）：
+    「强会话凭据」仅指 auth_token / access_token / login_token / jwt 这类「登录后才签发」
+    的 Cookie 或 JSON 字段；而 ASPSESSIONIDxxxx / ASP.NET_SessionId / JSESSIONID / PHPSESSID
+    / sessionid / sid 等通用会话标识**匿名访问就会下发**，登录失败时也会下发，绝不作为
+    成功证据（见 STRONG_COOKIE_PAT / WEAK_COOKIE_PAT）。
+
+    三条防误判的核心约束（踩过坑，别回退）：
       A. JS 跳转不单独作为成功证据。站点首页常自带
          document.location='.../index.jsp' 这类静态跳转，匿名访问就有；且 index/home/
          main 这类名字太常见，靠跳转目标名字猜必然误判。只有伴随会话凭据才算证据。
       B. 「跳转」只认实质跳转。http→https、加/去 www、去默认端口这类 URL 规范化
          不算；根路径 "/" 也不算登录后页面（匿名就能到首页）；匿名访问也会落到
          同一地址的重定向（门户站统一 302 到 /index.jsp）同样不算。
+      C. 「强会话凭据」必须是**本次登录响应中新出现**的——匿名基线里同名 Cookie 已存在，
+         或匿名访问就下发了同名 JSON 凭据，都不能作为成功证据（避免靠 Cookie 名字
+         猜而误报；很多站点非登录接口也会返回 token 字段）。
 
     anon：匿名基线响应（登录前 GET 的结果）。用于识别「站点固有静态跳转」——
     若匿名页面里存在相同的 JS 跳转目标，则该跳转与登录无关，不作为成功证据。
@@ -471,6 +521,15 @@ def judge_login_response(r, login_url, success_contains=None, fail_contains=None
     等证据，供 judge_protected_page 做二次仲裁。
     """
     text, status = r["text"], r["status"]
+
+    # 0. 验证码检测（最高优先级）：页面出现验证码/滑块/短信/二次验证特征词，说明该站点
+    #    需要人工交互才能登录，脚本无法自动完成。此时无论后续是否出现"登录后元素"或
+    #    "会话凭据"都不能判成功——那些极可能是验证码页面自带的干扰元素。归入
+    #    verdict="captcha"，由调用方单独写入「需人工复核」文档，不进成功清单。
+    low_text = text.lower()
+    for w in CAPTCHA_WORDS:
+        if w.lower() in low_text:
+            return "captcha", f"页面要求验证码/二次验证（命中特征词 {w!r}），需人工复核", {}
 
     # 显式指定的失败关键字
     if fail_contains and fail_contains in text:
@@ -490,13 +549,11 @@ def judge_login_response(r, login_url, success_contains=None, fail_contains=None
         if w.lower() in text.lower():
             return "fail", f"响应含失败特征词 {w!r}", {}
 
-    # 显式指定的成功关键字（用户明确说这个字符串=成功，优先采纳）
-    if success_contains:
-        return ("success", f"命中成功关键字 {success_contains!r}", {}) if success_contains in text \
-            else ("fail", f"未命中成功关键字 {success_contains!r}", {})
+    # 3. 显式 --success-contains：命中即成功；未命中不判定为失败，继续按后续规则判断
+    if success_contains and success_contains in text:
+        return "success", f"命中成功关键字 {success_contains!r}", {}
 
     # 收集行为证据
-    strong, weak = _classify_cookies(r["cookies"])
     # 只认「实质跳转」——http→https、加/去 www 这类 URL 规范化不算登录跳转
     redirected = _is_substantive_redirect(login_url, r["final_url"])
     redirected_to_login = redirected and LOGIN_URL_PAT.search(urlparse(r["final_url"]).path)
@@ -509,6 +566,14 @@ def judge_login_response(r, login_url, success_contains=None, fail_contains=None
                 redirected_to_home = False
         except Exception:
             pass
+    # 收集强/弱 Cookie，以及 JSON 业务凭据
+    strong, weak = _classify_cookies(r["cookies"])
+    # 关键：匿名基线里已有的同名 Cookie，不能作为「本次登录新签发」的凭据。
+    # 很多站点匿名访问就下发 token/auth 等命名的 Cookie（或非登录接口也返回 token 字段），
+    # 纯靠名字判断必然误报。只有匿名基线里不存在、登录后才出现的强凭据才算数。
+    anon_cookies = set((anon or {}).get("cookies") or [])
+    strong = [c for c in strong if c not in anon_cookies]
+
     has_credential = bool(strong) or (ev is not None and ev[0] is True)
     has_form = bool(LOGIN_PAGE_PAT.search(text))
     post_login_hit = next((w for w in POST_LOGIN_ELEMENTS if w.lower() in text.lower()), None)
@@ -687,7 +752,8 @@ def judge_protected_page(anon, auth, contains=None, login_verdict=None, login_re
       2. 登录前后表单消失 + 出现登录后元素 → 成功
       3. 登录响应已明确成功（凭据/跳转）→ 以它为准，页面相似度不作否决
       4. 指定了 contains：出现即成功、未出现即失败
-      5. 兜底：登录前后内容相似度 ≤80%（变化明显）→ 成功，否则失败
+      5. 兜底：登录前后内容相似度 ≤80%（变化明显）→ 成功；
+         相似度 >80%（内容未变）→ **异常**（不判失败，避免漏掉 SPA 等正确密码，留待复核）
     """
     anon_plain = _plain_text(anon["text"])
     auth_plain = _plain_text(auth["text"])
@@ -710,9 +776,9 @@ def judge_protected_page(anon, auth, contains=None, login_verdict=None, login_re
 
     # 1. 登录后仍是登录墙
     wall = _is_login_wall(auth)
-    if wall and login_verdict != "success":
+    if wall and login_verdict not in ("success", "captcha"):
         return "fail", f"登录后仍被拦截（{wall}）", info
-    if auth["status"] >= 400 and login_verdict != "success":
+    if auth["status"] >= 400 and login_verdict not in ("success", "captcha"):
         return "fail", f"登录后访问返回 HTTP {auth['status']}", info
 
     # 指定了登录后才会出现的内容：以它为准（优先级最高，用户显式指定）
@@ -725,6 +791,10 @@ def judge_protected_page(anon, auth, contains=None, login_verdict=None, login_re
     if login_verdict == "fail":
         return "fail", f"登录响应判定失败：{login_reason}", info
 
+    # 登录响应判定为验证码/二次验证 → 转入人工复核，页面特征不作翻案（绝不判成功）
+    if login_verdict == "captcha":
+        return "captcha", f"登录响应判定需人工复核：{login_reason}", info
+
     # 2. 表单消失 + 出现登录后元素 → 成功
     if anon_has_form and not auth_has_form and auth_post_login_hit:
         return "success", f"登录表单消失且出现登录后元素 {auth_post_login_hit!r}", info
@@ -734,8 +804,12 @@ def judge_protected_page(anon, auth, contains=None, login_verdict=None, login_re
         return "success", f"登录响应已给出成功证据：{login_reason}", info
 
     # 5. 兜底：内容相似度
+    #    宁可放过成功误报，也绝不漏掉正确密码：相似度低（内容变化明显）→ 判成功；
+    #    相似度高（内容几乎没变）时**不再武断判失败**——很多正确登录后站点返回几乎
+    #    相同的页面（SPA 单页应用登录态由 JS 异步加载、或登录后停留在一个骨架不变的
+    #    确认页），此时若判 fail 就会漏掉真实正确的密码。故改为退回「异常」，留待人工复核。
     if ratio > 0.8:
-        return "fail", f"登录前后内容相似度 {ratio:.0%}（>80%），内容未发生变化", info
+        return "unknown", f"登录前后内容相似度 {ratio:.0%}（>80%），内容未发生明显变化，需人工复核", info
     return "success", f"登录前后内容相似度 {ratio:.0%}（≤80%），内容已发生变化", info
 
 
@@ -916,7 +990,7 @@ def run_with_ceiling(fn, ceiling, timeout_result):
     return box.get("v", ("error", "未知内部错误", ""))
 
 
-VERDICT_LABELS = {"success": "成功", "fail": "失败", "unknown": "异常", "error": "异常"}
+VERDICT_LABELS = {"success": "成功", "fail": "失败", "unknown": "异常", "error": "异常", "captcha": "验证码"}
 
 
 def run_one_hard(item, args, hard_timeout):
@@ -1066,6 +1140,38 @@ def write_success_files(success_list, output_dir, script_dir):
     return written
 
 
+def write_captcha_files(captcha_list, output_dir, script_dir):
+    """把「需人工复核（验证码/二次验证）」清单按根域名分组写入文档。
+
+    文档命名为 <根域名>_captcha.txt，与成功文档（<根域名>.txt）分开，避免污染成功清单。
+    每行格式：url:username:password。返回写出的文件路径列表。
+    """
+    if not captcha_list:
+        return []
+    groups = {}
+    for _, url, username, password in captcha_list:
+        groups.setdefault(root_domain(url), []).append((url, username, password))
+
+    out_dir = output_dir or script_dir
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        out_dir = script_dir
+
+    written = []
+    for domain, items in groups.items():
+        safe = re.sub(r"[^0-9a-zA-Z.\-_]", "_", domain) or "_unknown"
+        path = os.path.join(out_dir, f"{safe}_captcha.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for url, username, password in items:
+                    f.write(f"{url}:{username}:{password}\n")
+            written.append(path)
+        except Exception as e:  # noqa: BLE001 - 写盘失败不能中断整个检测
+            out(f"[写文档失败] {safe}_captcha.txt：{_brief_error(e)}")
+    return written
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="携带账号密码登录并验证是否成功。支持单条（--url -u -p）或批量（--file）。")
@@ -1083,7 +1189,8 @@ def main():
                     help="关闭行为验证，只看登录接口响应（不推荐）")
     ap.add_argument("--check-contains", default=None,
                     help="验证页中应出现的内容（如昵称、'我的订单'），出现即视为成功")
-    ap.add_argument("--success-contains", default=None, help="登录响应中出现该字符串即视为成功")
+    ap.add_argument("--success-contains", default=None,
+                    help="登录响应中出现该字符串即视为成功；未命中不判定失败，继续按其他规则判断")
     ap.add_argument("--fail-contains", default=None, help="登录响应中出现该字符串即视为失败")
     ap.add_argument("--auto-fields", dest="auto_fields", action="store_true", default=True,
                     help="自动从登录页抽取并携带隐藏字段，如 CAS 的 lt/execution/_eventId、CSRF token（默认开启）")
@@ -1141,21 +1248,25 @@ def main():
             + (f"，总时限 {fmt_dur(args.max_time)}" if args.max_time else "") + "）：")
         out(f"网络：{net_desc(args)}；引擎：{'requests' if HAS_REQUESTS else 'urllib'}")
 
-        n_success = n_fail = n_error = 0
+        n_success = n_fail = n_error = n_captcha = 0
         done = 0
         success_list = []
+        captcha_list = []
         print_lock = threading.Lock()
         t_start = time.monotonic()
 
         pwd_map = {i: pwd for i, (_, _, pwd) in enumerate(targets, 1)}
 
         def emit(idx, url, username, label, reason, detail):
-            nonlocal done, n_success, n_fail, n_error
+            nonlocal done, n_success, n_fail, n_error, n_captcha
             with print_lock:
                 done += 1
                 if label == "成功":
                     n_success += 1
                     success_list.append((idx, url, username, pwd_map.get(idx, "")))
+                elif label == "验证码":
+                    n_captcha += 1
+                    captcha_list.append((idx, url, username, pwd_map.get(idx, "")))
                 elif label == "失败":
                     n_fail += 1
                 else:
@@ -1168,13 +1279,13 @@ def main():
                     el = time.monotonic() - t_start
                     eta = el / done * (len(targets) - done)
                     out(f"  -- 进度 {done}/{len(targets)} ({done/len(targets):.1%}) | "
-                        f"成功 {n_success} 失败 {n_fail} 异常 {n_error} | "
+                        f"成功 {n_success} 失败 {n_fail} 异常 {n_error} 验证码 {n_captcha} | "
                         f"已用 {fmt_dur(el)} 预计剩余 {fmt_dur(eta)}")
 
         def summary():
             out()
             out("-" * 60)
-            out(f"汇总：成功 {n_success} / 失败 {n_fail} / 异常 {n_error} / 共 {len(targets)}"
+            out(f"汇总：成功 {n_success} / 失败 {n_fail} / 异常 {n_error} / 验证码 {n_captcha} / 共 {len(targets)}"
                 f"（实际完成 {done} 条，用时 {fmt_dur(time.monotonic() - t_start)}）")
             success_list.sort(key=lambda x: x[0])
             if success_list:
@@ -1187,6 +1298,19 @@ def main():
                 if written:
                     out()
                     out(f"已按根域名写出 {len(written)} 份成功结果文档：")
+                    for p in written:
+                        out(f"  {p}")
+            # 验证码/二次验证 → 单独输出到「需人工复核」文档，绝不与成功清单混在一起
+            captcha_list.sort(key=lambda x: x[0])
+            if captcha_list:
+                out()
+                out(f"验证码清单（{len(captcha_list)} 条，需人工复核，格式 url:username:password）：")
+                for _, url, username, password in captcha_list:
+                    out(f"{url}:{username}:{password}")
+                written = write_captcha_files(captcha_list, args.output_dir, _script_dir)
+                if written:
+                    out()
+                    out(f"已按根域名写出 {len(written)} 份验证码复核文档（<域名>_captcha.txt）：")
                     for p in written:
                         out(f"  {p}")
             if n_error:
@@ -1245,6 +1369,9 @@ def main():
     if verdict == "success":
         out("登录成功")
         code = 0
+    elif verdict == "captcha":
+        out(f"需人工复核（{reason}）")
+        code = 1
     elif verdict == "error":
         out(f"请求异常：{reason}")
         code = 2
