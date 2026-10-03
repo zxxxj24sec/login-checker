@@ -8,9 +8,6 @@
   2. 批量检测：--file 指向一个文本文件，每行一条 "url:username:password"
 
 【判定规则】（按优先级从高到低）
-  0. 页面要求验证码/二次验证（验证码/滑块/短信/recaptcha 等特征词）→ 验证码
-     （**最高优先级**，脚本无法自动完成，转入「需人工复核」文档单独输出，
-      不进成功清单、也不判失败）
   1. 接口明确返回认证失败（JSON 非 0 业务码 / success=false / HTTP 401·403）→ 失败
   2. 登录失败特征词存在（密码错误 / 认证失败 / login failed …）→ 失败
   3. 跳回登录页 / 跳到 CAS 统一认证页 → 失败
@@ -20,11 +17,15 @@
      （必须对照匿名基线：匿名页有表单且现在没了、且该元素匿名页没有）
   6. 实质跳转到登录后页面 → 成功
   7. 兜底：登录前后页面内容相似度 ≤80%（变化明显）→ 成功；
-     相似度 >80%（内容未变）→ 异常（不武断判失败，避免漏掉正确密码，留待人工复核）
+     相似度 >80%（内容未变）→ 异常（不武断判失败，避免漏掉正确密码）
 其余 → 异常（无明确证据，保守不判成功）。
 
-  验证码条目单独写文档：<根域名>_captcha.txt，与成功文档 <根域名>.txt 分开，
-  供人工复核，绝不与成功账密混在一起。
+  * 验证码**不再提前拦截**：带验证码的站点照常走登录流程，登录成功算成功，
+    登录失败/异常则归入「验证码/复核」文档。
+
+  最终只输出**两类文档**：
+    - 成功：<根域名>.txt（登录成功）
+    - 复核：<根域名>_captcha.txt（验证码/失败/异常等所有「非成功」条目，需人工复核）
 
   * 「强会话凭据」≠ 通用会话 Cookie。ASPSESSIONIDxxxx / ASP.NET_SessionId / JSESSIONID /
     PHPSESSID / sessionid / sid 这类通用会话标识**匿名访问就会下发**，登录失败时也下发，
@@ -308,36 +309,121 @@ def dns_precheck(url, timeout=3.0):
 
 
 # --------------------------------------------------------------------------- #
+# urllib 连接复用（解决 --insecure 切到 urllib 后失去 keep-alive 导致的变慢）
+# --------------------------------------------------------------------------- #
+# 说明：--insecure 会强制用 urllib 引擎（见 HttpSession.__init__）。标准库 urllib
+# 默认每次 open() 都新建 TCP+TLS 连接，没有连接池，大批量场景下每条都要重新
+# 三次握手 + TLS 握手，整体吞吐大幅下降。这里的 _ConnectionPool 按 (scheme, host,
+# port) 缓存底层 http.client 连接，实现 keep-alive 复用（详见 request 的 urllib 分支）。
+import http.client
+
+
+class _ConnectionPool:
+    """按 (scheme, host, port) 缓存 http.client 连接，支持 HTTPS 自定义 SSLContext。"""
+
+    def __init__(self, ssl_context=None):
+        self._conns = {}
+        self._ssl_context = ssl_context
+        self._lock = threading.Lock()
+
+    def get_connection(self, scheme, host, port):
+        key = (scheme, host, port)
+        with self._lock:
+            conn = self._conns.get(key)
+            if conn is not None and conn.sock is not None:
+                return conn
+            if scheme == "https":
+                conn = http.client.HTTPSConnection(host, port, context=self._ssl_context, timeout=15)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=15)
+            self._conns[key] = conn
+            return conn
+
+    def close_all(self):
+        with self._lock:
+            for conn in self._conns.values():
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._conns.clear()
+
+
+class _FakeResponse:
+    """供 CookieJar.extract_cookies 使用的轻量响应对象，只提供 URL 和 headers。"""
+
+    def __init__(self, url, headers):
+        self.url = url
+        self.headers = headers
+
+    def info(self):
+        return self.headers
+
+    def geturl(self):
+        return self.url
+
+
+# --------------------------------------------------------------------------- #
 # 会话（跨请求保持 Cookie）
 # --------------------------------------------------------------------------- #
 class HttpSession:
     """优先 requests.Session，回退 urllib + cookiejar；两者都能跨请求保持 Cookie。"""
 
-    def __init__(self, proxy=None, env_proxy=True):
-        self.engine = "requests" if HAS_REQUESTS else "urllib"
-        if HAS_REQUESTS:
+    def __init__(self, proxy=None, env_proxy=True, insecure=False):
+        # insecure 时强制用 urllib 引擎：requests/urllib3 会在 verify=False 时用
+        # ssl._create_unverified_context() 重新创建 context，覆盖掉我们想设置的
+        # @SECLEVEL=0 加密策略，导致 DH key 太小、旧 TLS 协议等站点仍握手失败。
+        # urllib 引擎直接用我们构造的 context，能同时跳过证书校验 + 放宽加密策略。
+        if insecure:
+            self.engine = "urllib"
+        else:
+            self.engine = "requests" if HAS_REQUESTS else "urllib"
+
+        if self.engine == "requests":
             self._s = requests.Session()
             self._s.trust_env = env_proxy
             if proxy:
                 self._s.proxies = {"http": proxy, "https": proxy}
         else:
             import http.cookiejar
+            import ssl
             import urllib.request
 
             self._cj = http.cookiejar.CookieJar()
-            handlers = [urllib.request.HTTPCookieProcessor(self._cj)]
-            if proxy:
-                handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-            elif not env_proxy:
-                handlers.append(urllib.request.ProxyHandler({}))  # 空映射 = 不读环境变量里的代理
-            self._opener = urllib.request.build_opener(*handlers)
+            self._proxy = proxy
+            self._env_proxy = env_proxy
+            # 连接池：insecure 时复用连接（keep-alive），解决 urllib 每次新建连接导致的慢
+            self._pool = None
+            self._ctx = None
+            if insecure:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                # 放宽加密策略：处理 DH key 太小（DH_KEY_TOO_SMALL）、旧 TLS 协议等
+                # 高校/机构老服务器常见，严格策略下即使跳过证书校验也握手失败。
+                try:
+                    ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+                except Exception:
+                    pass
+                self._ctx = ctx
+                self._pool = _ConnectionPool(ssl_context=ctx)
+            # 保留 opener 仅用于非 insecure 的普通 urllib 回退（无 requests 时）
+            if not insecure:
+                handlers = [urllib.request.HTTPCookieProcessor(self._cj)]
+                if proxy:
+                    handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+                elif not env_proxy:
+                    handlers.append(urllib.request.ProxyHandler({}))  # 空映射 = 不读环境变量里的代理
+                self._opener = urllib.request.build_opener(*handlers)
 
     def close(self):
-        if HAS_REQUESTS:
+        if self.engine == "requests":
             try:
                 self._s.close()
             except Exception:
                 pass
+        elif self._pool is not None:
+            self._pool.close_all()
 
     def request(self, method, url, headers=None, data=None, json_body=None, timeout=15,
                 max_bytes=1048576, read_timeout=None):
@@ -352,7 +438,7 @@ class HttpSession:
         if read_timeout is None:
             read_timeout = max(timeout * 3, 5)
 
-        if HAS_REQUESTS:
+        if self.engine == "requests":
             resp = self._s.request(method, url, headers=headers, data=data, json=json_body,
                                    timeout=timeout, allow_redirects=True, stream=True)
             cookies = list(resp.cookies.keys()) or _cookie_names_from_headers(resp.headers.get("Set-Cookie", ""))
@@ -377,26 +463,41 @@ class HttpSession:
                 except Exception:
                     pass
             text = _decode(b"".join(chunks), resp.encoding)
+            return {"status": status, "headers": hdrs, "text": _unescape_unicode(text),
+                    "final_url": final_url, "cookies": cookies, "truncated": truncated}
+
+        return self._request_urllib(method, url, headers, data, json_body,
+                                    timeout, max_bytes, read_timeout)
+
+    def _request_urllib(self, method, url, headers, data, json_body,
+                        timeout, max_bytes, read_timeout):
+        """urllib 引擎的实现：带连接池复用（keep-alive）、Cookie 自动维护、重定向跟随。
+
+        用 http.client 直接发请求，配合 _ConnectionPool 复用底层 TCP/TLS 连接，
+        解决标准 urllib 每次 open() 新建连接导致 --insecure 变慢的问题。
+        """
+        import http.cookiejar
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        if json_body is not None:
+            body = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif data is not None:
+            body = urlencode(data).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
         else:
-            import urllib.request
-            import urllib.error
+            body = None
 
-            if json_body is not None:
-                body = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
-                headers["Content-Type"] = "application/json"
-            elif data is not None:
-                body = urlencode(data).encode("utf-8")
-                headers["Content-Type"] = "application/x-www-form-urlencoded"
-            else:
-                body = None
-
+        # 若为普通 urllib 回退（无连接池），走原 opener 路径
+        if self._pool is None:
             req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
             try:
                 resp = self._opener.open(req, timeout=timeout)
-            except urllib.error.HTTPError as e:  # 4xx/5xx 也有响应体，需照常读取
+            except urllib.error.HTTPError as e:
                 resp = e
             with resp:
-                # 分块读 + 时间预算，避免 read(n) 一次性阻塞在慢速流上
                 chunks, total, truncated = [], 0, False
                 deadline = time.monotonic() + read_timeout
                 while True:
@@ -412,8 +513,108 @@ class HttpSession:
                 cookies = _cookie_names_from_headers("; ".join(resp.headers.get_all("Set-Cookie") or []))
             status, final_url, hdrs = resp.code, resp.geturl(), dict(resp.headers)
             text = _decode(raw, resp.headers.get_content_charset())
+            return {"status": status, "headers": hdrs, "text": _unescape_unicode(text),
+                    "final_url": final_url, "cookies": cookies, "truncated": truncated}
 
-        return {"status": status, "headers": hdrs, "text": _unescape_unicode(text),
+        # 连接池路径：手动发请求 + 重定向 + Cookie 维护
+        current_url = url
+        redirects = 0
+        truncated = False
+        final_url = url
+        final_status = 0
+        final_hdrs = {}
+        cookies = []
+
+        while redirects <= 10:
+            parts = urllib.parse.urlsplit(current_url)
+            scheme = parts.scheme.lower()
+            if scheme not in ("http", "https"):
+                raise urllib.error.URLError("unsupported scheme: %s" % scheme)
+            host = parts.hostname
+            port = parts.port or (443 if scheme == "https" else 80)
+            selector = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+
+            # 注入 Cookie
+            req_headers = dict(headers)
+            try:
+                cj_header = self._cj.add_cookie_header  # 占位，实际用 get
+            except Exception:
+                pass
+            # 用 CookieJar 生成该请求的 Cookie 头
+            cj_req = urllib.request.Request(current_url)
+            self._cj.add_cookie_header(cj_req)
+            cookie_header = cj_req.get_header("Cookie")
+            if cookie_header:
+                req_headers["Cookie"] = cookie_header
+            if body is not None:
+                req_headers["Content-Length"] = str(len(body))
+            if "Host" not in req_headers:
+                req_headers["Host"] = host if port in (80, 443) else "%s:%s" % (host, port)
+
+            conn = self._pool.get_connection(scheme, host, port)
+            try:
+                conn.request(method.upper(), selector, body=body, headers=req_headers)
+                resp = conn.getresponse()
+            except Exception:
+                # 连接可能已失效，关闭后重建重试一次
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = self._pool.get_connection(scheme, host, port)
+                conn.request(method.upper(), selector, body=body, headers=req_headers)
+                resp = conn.getresponse()
+
+            status = resp.status
+            resp_headers = dict(resp.headers)
+            # 读取 body（带预算 + 截断）
+            chunks, total = [], 0
+            deadline = time.monotonic() + read_timeout
+            while True:
+                if total >= max_bytes or time.monotonic() >= deadline:
+                    truncated = True
+                    break
+                block = resp.read(min(65536, max_bytes - total))
+                if not block:
+                    break
+                chunks.append(block)
+                total += len(block)
+            raw = b"".join(chunks)
+
+            # 处理 Set-Cookie 回填
+            set_cookie = resp_headers.get("Set-Cookie") or resp_headers.get("set-cookie")
+            if set_cookie:
+                # CookieJar 需要 Response 对象，构造一个假的 response 来喂 cookie
+                fake_resp = _FakeResponse(current_url, resp_headers)
+                try:
+                    self._cj.extract_cookies(fake_resp, urllib.request.Request(current_url))
+                except Exception:
+                    pass
+                cookies = _cookie_names_from_headers(set_cookie if isinstance(set_cookie, str) else "; ".join(set_cookie))
+
+            final_status = status
+            final_hdrs = resp_headers
+            final_url = current_url
+
+            # 重定向跟随
+            if status in (301, 302, 303, 307, 308):
+                loc = resp_headers.get("Location") or resp_headers.get("location")
+                if loc:
+                    redirects += 1
+                    new_url = urllib.parse.urljoin(current_url, loc)
+                    # 302/303 后 GET 语义：转 GET 且清空 body
+                    if status in (302, 303) or (status in (301, 307, 308) and method.upper() != "GET" and status == 303):
+                        if status in (302, 303):
+                            method = "GET"
+                            body = None
+                            headers.pop("Content-Type", None)
+                            headers.pop("Content-Length", None)
+                    current_url = new_url
+                    continue
+            break
+
+        text = _decode(raw, final_hdrs.get("Content-Type"))
+        return {"status": final_status, "headers": final_hdrs, "text": _unescape_unicode(text),
                 "final_url": final_url, "cookies": cookies, "truncated": truncated}
 
     def post_login(self, url, payload, as_json=False, timeout=15, max_bytes=1048576, read_timeout=None):
@@ -472,6 +673,39 @@ def extract_form_fields(html):
     return fields
 
 
+# 验证码输入字段名 / 验证码图片路径关键词：用于判断「登录页是否需要验证码」。
+# 仅匹配 input/textarea/select 的 name 属性，以及 img 的 src 路径，避免把页面里
+# 「验证码错误」这类提示文案误判成「需要验证码」。
+CAPTCHA_NAME_KEYWORDS = (
+    "captcha", "verifycode", "validatecode", "valicode", "checkcode", "authcode",
+    "image_code", "imgcode", "vcode", "randcode", "randomcode", "verify",
+    "securitycode", "security_code", "captchacode", "captcha_code",
+)
+CAPTCHA_FIELD_RE = re.compile(r"""(?is)<(?:input|textarea|select)\b[^>]*\bname\s*=\s*["']([^"']+)["']""")
+CAPTCHA_IMG_RE = re.compile(
+    r"""<img\b[^>]*\bsrc\s*=\s*["'][^"']*(?:captcha|verifycode|validatecode|"""
+    r"""checkcode|authcode|vcode|randcode|randomcode|verify)[^"']*["']""", re.I)
+
+
+def page_requires_captcha(html):
+    """判断登录页是否需要验证码（依据：表单里有无验证码输入字段，或有无验证码图片）。
+
+    只认「验证码输入框的 name」和「验证码图片的 src 路径」，不做全文特征词匹配，
+    避免把「验证码错误」等提示文案误判为需要验证码。
+    """
+    if not html:
+        return False
+    # 1) 输入框/文本域/下拉框的 name 含验证码关键词
+    for m in CAPTCHA_FIELD_RE.finditer(html):
+        name = m.group(1).lower()
+        if any(kw in name for kw in CAPTCHA_NAME_KEYWORDS):
+            return True
+    # 2) 验证码图片（src 路径含关键词）
+    if CAPTCHA_IMG_RE.search(html):
+        return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # 判定
 # --------------------------------------------------------------------------- #
@@ -479,8 +713,6 @@ def judge_login_response(r, login_url, success_contains=None, fail_contains=None
     """分析登录接口响应，返回 (verdict, reason, info)，verdict ∈ {success, fail, unknown, captcha}。
 
     判定优先级（从高到低）：
-      0. 页面要求验证码/二次验证（验证码/滑块/短信/recaptcha 等特征词）→ captcha
-         （**最高优先级**，需人工复核，单独输出、不进成功清单）
       1. 显式 --fail-contains 命中 → 失败
       2. 接口明确返回认证失败（JSON 非 0 业务码 / success=false / HTTP 401·403·其他 4xx·5xx）
       3. 登录失败特征词（密码错误 / 认证失败 / login failed …）
@@ -491,12 +723,19 @@ def judge_login_response(r, login_url, success_contains=None, fail_contains=None
       8. 有强会话凭据且脚本跳转（非静态）→ 成功
       9. 有强会话凭据（凭据本身就是证据，不依赖跳转）→ 成功
      10. 登录表单消失 + 出现登录后元素 → 成功（**必须能拿到匿名基线**：
-          匿名页有表单且现在没了、且该元素匿名页没有，才算有效；拿不到基线则不启用）
+          匿名页有表单且现在没了、且该元素匿名页没有，才算有效）
+          —— 拿不到匿名基线时 → unknown（异常）
      11. 响应仍是登录表单 → 失败
      12. 实质跳转到登录后页面（且匿名访问不会落到同一地址）→ 成功
-     13. 无凭据的 JS 跳转 → 目标含 login/error/fail/cas 判失败，其余一律 unknown
-     14. 仅通用会话 Cookie（ASPSESSIONIDxxxx/JSESSIONID/PHPSESSID 等）→ unknown
-      其余 → unknown。
+     13. 无凭据的 JS 跳转 → 目标含 login/error/fail/cas → 失败
+     14. JS 跳转但匿名访问同样存在（站点固有静态跳转）→ 失败
+     15. JS 跳转但无会话凭据、无法确认是登录后页面 → 失败
+     16. 仅通用会话 Cookie（ASPSESSIONIDxxxx/JSESSIONID/PHPSESSID 等）→ 失败
+     17. HTTP 200 但无任何成功/失败证据 → 失败
+
+    注：验证码**不再提前拦截**。带验证码的站点照常走登录流程——登录成功则算成功
+    （不少站点验证码弱校验/可空，仍能登录）；登录失败/异常则在调用方归入「验证码/复核」
+    文档。即本函数只返回 success / fail / unknown，captcha 由调用方在「非成功」时统一标注。
 
     「强会话凭据」仅指 auth_token / access_token / login_token / jwt 这类「登录后才签发」
     的 Cookie 或 JSON 字段；而 ASPSESSIONIDxxxx / ASP.NET_SessionId / JSESSIONID / PHPSESSID
@@ -522,14 +761,9 @@ def judge_login_response(r, login_url, success_contains=None, fail_contains=None
     """
     text, status = r["text"], r["status"]
 
-    # 0. 验证码检测（最高优先级）：页面出现验证码/滑块/短信/二次验证特征词，说明该站点
-    #    需要人工交互才能登录，脚本无法自动完成。此时无论后续是否出现"登录后元素"或
-    #    "会话凭据"都不能判成功——那些极可能是验证码页面自带的干扰元素。归入
-    #    verdict="captcha"，由调用方单独写入「需人工复核」文档，不进成功清单。
-    low_text = text.lower()
-    for w in CAPTCHA_WORDS:
-        if w.lower() in low_text:
-            return "captcha", f"页面要求验证码/二次验证（命中特征词 {w!r}），需人工复核", {}
+    # 注：验证码不再「提前拦截」。带验证码的站点照常走登录流程——若登录成功则算成功
+    # （不少站点验证码弱校验/可空，仍能登录）；若失败则在调用方归入「验证码/复核」文档。
+    # 这里只记录页面是否出现验证码特征词，供 reason 里提示，不改变判定结果。
 
     # 显式指定的失败关键字
     if fail_contains and fail_contains in text:
@@ -637,9 +871,9 @@ def judge_login_response(r, login_url, success_contains=None, fail_contains=None
     #     必须同时满足两个基线条件，否则极易误判：
     #       · 匿名页确实有表单（"消失"才成立；本来就没表单的门户站不算）
     #       · 该元素匿名页没有（否则是站点固有文案，如首页静态链接里的 /dashboard）
-    #     拿不到匿名基线时一律不启用本规则，保守判 unknown。
     if anon_has_form and not has_form and post_login_hit:
         return "success", f"登录表单消失且出现登录后元素 {post_login_hit!r}", info
+    # 10 的异常分支：拿不到匿名基线时，无法确认该元素是登录后新增的 → 异常
     if not has_form and post_login_hit and not anon_text:
         return "unknown", (f"响应无登录表单且出现 {post_login_hit!r}，但缺少匿名基线、"
                            f"无法确认该元素是登录后新增的，不足以判定成功"), info
@@ -652,24 +886,28 @@ def judge_login_response(r, login_url, success_contains=None, fail_contains=None
     if redirected_to_home:
         return "success", f"已跳转到登录后页面 {r['final_url']}", info
 
-    # 13. 无凭据的 JS 跳转：一律不作为成功证据
+    # 13~15. 无凭据的 JS 跳转：一律不作为成功证据
     #     站点首页常自带 document.location='.../index.jsp' 这类静态跳转，匿名访问就有；
     #     没有会话凭据时无法区分"登录跳转"和"站点固有跳转"，只能判证据不足。
     if js_target:
         low = js_target.lower()
+        # 13. 跳转目标是登录页 / 错误页 / CAS 认证页 → 明确失败
         if LOGIN_URL_PAT.search(low) or "error" in low or "fail" in low or js_is_cas:
             return "fail", f"脚本跳转到 {js_target or '登录页'}，鉴权未通过", info
+        # 14. 匿名访问也有同样跳转（站点固有静态跳转）→ 与登录无关，判失败
         if js_is_static:
-            return "unknown", (f"响应含脚本跳转到 {js_target}，但匿名访问时该跳转同样存在，"
-                               f"属站点固有跳转、与登录无关；且无会话凭据，不足以判定成功"), info
-        return "unknown", (f"响应含脚本跳转到 {js_target}，但无会话凭据、无法确认是登录后页面，"
-                           f"不足以判定成功"), info
+            return "fail", (f"响应含脚本跳转到 {js_target}，但匿名访问时该跳转同样存在，"
+                            f"属站点固有跳转、与登录无关；且无会话凭据，不足以判定成功"), info
+        # 15. 无凭据、无法确认是登录后页面 → 失败
+        return "fail", (f"响应含脚本跳转到 {js_target}，但无会话凭据、无法确认是登录后页面，"
+                        f"不足以判定成功"), info
 
-    # 14. 仅通用 Cookie（JSESSIONID/PHPSESSID 等）：登录失败时也会下发，不算证据
+    # 16. 仅通用 Cookie（JSESSIONID/PHPSESSID 等）：登录失败时也会下发，不算证据 → 失败
     if weak:
-        return "unknown", (f"仅收到通用 Cookie（{', '.join(weak)}），这类 Cookie 登录失败时也会下发，"
-                           f"不足以证明成功；HTTP {status} 同样不能作为成功依据"), info
-    return "unknown", f"HTTP {status}，但未找到任何成功证据（无业务码、无会话 Cookie、无跳转）", info
+        return "fail", (f"仅收到通用 Cookie（{', '.join(weak)}），这类 Cookie 登录失败时也会下发，"
+                        f"不足以证明成功；HTTP {status} 同样不能作为成功依据"), info
+    # 17. HTTP 200 但无任何成功/失败证据 → 失败
+    return "fail", f"HTTP {status}，但未找到任何成功证据（无业务码、无会话 Cookie、无跳转）", info
 
 
 def _js_redirect_target(text):
@@ -791,7 +1029,9 @@ def judge_protected_page(anon, auth, contains=None, login_verdict=None, login_re
     if login_verdict == "fail":
         return "fail", f"登录响应判定失败：{login_reason}", info
 
-    # 登录响应判定为验证码/二次验证 → 转入人工复核，页面特征不作翻案（绝不判成功）
+    # 登录响应判定为验证码/二次验证 → 转入人工复核，页面特征不作翻案（绝不判成功）。
+    # 注：当前 judge_login_response 已不再返回 captcha（验证码不提前拦截），此分支为
+    # 防御性保留，正常流程不会走到。
     if login_verdict == "captcha":
         return "captcha", f"登录响应判定需人工复核：{login_reason}", info
 
@@ -803,7 +1043,7 @@ def judge_protected_page(anon, auth, contains=None, login_verdict=None, login_re
     if login_verdict == "success":
         return "success", f"登录响应已给出成功证据：{login_reason}", info
 
-    # 5. 兜底：内容相似度
+    # 5. 兜底：内容相似度（对应 README 判定表第 18/19 条）
     #    宁可放过成功误报，也绝不漏掉正确密码：相似度低（内容变化明显）→ 判成功；
     #    相似度高（内容几乎没变）时**不再武断判失败**——很多正确登录后站点返回几乎
     #    相同的页面（SPA 单页应用登录态由 JS 异步加载、或登录后停留在一个骨架不变的
@@ -887,7 +1127,7 @@ def check_one(url, username, password, args, check_url):
 
     返回 (verdict, reason, detail)，verdict ∈ {success, fail, unknown, error}。
     """
-    sess = HttpSession(proxy=args.proxy, env_proxy=args.env_proxy)
+    sess = HttpSession(proxy=args.proxy, env_proxy=args.env_proxy, insecure=args.insecure)
     try:
         return _check_one_inner(sess, url, username, password, args, check_url)
     except Exception as e:  # noqa: BLE001
@@ -963,6 +1203,13 @@ def _check_one_inner(sess, url, username, password, args, check_url):
 
         if verdict == "unknown":
             reason += "（建议对该站点单独用 -v --check-contains '登录后页面特征文字' 复核）"
+
+        # 验证码降级：判定失败时，若登录页本身需要验证码，则不判失败、
+        # 改归入「复核」——验证码挡着无法自动完成，不能据此认定密码错误。
+        if verdict == "fail" and page_requires_captcha(page_html):
+            verdict = "captcha"
+            reason = f"登录页需要验证码，无法自动完成登录，归入人工复核（原判定：{reason}）"
+
         return verdict, reason, detail
     except Exception as e:  # noqa: BLE001
         return "error", _brief_error(e), ""
@@ -1004,16 +1251,24 @@ def run_one_hard(item, args, hard_timeout):
     return idx, url, username, password, VERDICT_LABELS.get(verdict, "异常"), reason, detail
 
 
-def load_targets(path):
+def load_targets(path, domain=None):
     """读取批量文件，每行 url:username:password（忽略空行和 # 开头的注释）。
 
-    会被跳过并计入 errors 的三类：
-      1. 地址不是 http:// 或 https:// 开头；
-      2. 用户名或密码含冒号（无法与分隔符区分）；
-      3. 密码为空——空密码登录成功几乎必然是误判（无登录框的静态页也会"原样返回"），
+    会被跳过并计入 errors 的四类（**按优先级顺序判断**）：
+      1. 根域名不在 domain 白名单内（仅当传入 domain 时生效，**最先判断**）——不属于
+         目标域名的条目直接丢弃，后续校验都不再做，绝不发起登录请求；
+      2. 地址不是 http:// 或 https:// 开头；
+      3. 用户名或密码含冒号（无法与分隔符区分）；
+      4. 密码为空——空密码登录成功几乎必然是误判（无登录框的静态页也会"原样返回"），
          与其产生假阳性不如直接跳过，避免污染成功清单。
+
+    domain：逗号分隔的根域名白名单（如 "swu.edu.cn,ncepu.edu.cn"）。传入时，
+    条目的 URL 根域名必须精确等于其中之一才保留，否则丢弃。
     """
     target_re = re.compile(r"^(.*):([^/:]+):([^:]*)$")
+    allowed = None
+    if domain:
+        allowed = {d.strip().lower().lstrip(".") for d in domain.split(",") if d.strip()}
 
     targets, errors = [], []
     with open(path, "r", encoding="utf-8-sig") as f:
@@ -1030,6 +1285,15 @@ def load_targets(path):
                 errors.append(f"第 {lineno} 行格式错误（应为 url:username:password，且用户名/密码不能含冒号）：{raw.strip()}")
                 continue
             url, username, password = m.group(1), m.group(2), m.group(3)
+
+            # 根域名白名单过滤（**最先判断**，优先级最高）：URL 根域名不在白名单内
+            # 则直接丢弃，后续的冒号/空密码等校验都不再做，也绝不发起登录请求。
+            if allowed is not None:
+                rd = root_domain(url)
+                if rd not in allowed:
+                    errors.append(f"第 {lineno} 行根域名 {rd} 不在 --domain 白名单内，已丢弃：{raw.strip()}")
+                    continue
+
             sp = urlparse(url)
             if sp.scheme not in ("http", "https") or not sp.netloc or ":" in (sp.path or ""):
                 errors.append(f"第 {lineno} 行用户名或密码含冒号（不允许包含 ':'）：{raw.strip()}")
@@ -1216,9 +1480,18 @@ def main():
                     help="显式指定代理（如 http://127.0.0.1:8080），指定后不再读取环境变量里的代理")
     ap.add_argument("--no-env-proxy", dest="env_proxy", action="store_false", default=True,
                     help="忽略 HTTP_PROXY/HTTPS_PROXY 环境变量，全部直连")
+    ap.add_argument("--insecure", action="store_true",
+                    help="跳过 SSL 证书校验。高校/机构站点证书过期、自签、域名不匹配、"
+                         "中间证书缺失极常见，严格校验会导致大量 SSL 错误、根本连不上。"
+                         "对「登录凭据检测」场景跳过校验是合理的（只关心账号密码能否登录，"
+                         "不关心证书是否可信），但会失去中间人攻击防护。")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印详细诊断信息（相似度、状态码、响应预览等）")
     ap.add_argument("--output-dir", default=None,
                     help="成功结果文档输出目录（默认与脚本同目录）。每个根域名生成一个独立文档")
+    ap.add_argument("--domain", default=None,
+                    help="只检测指定根域名下的条目（如 --domain swu.edu.cn）。"
+                         "URL 的根域名与之不匹配的条目在加载阶段直接丢弃，不发起任何请求。"
+                         "可传多个，用逗号分隔（如 --domain swu.edu.cn,ncepu.edu.cn）")
     args = ap.parse_args()
 
     if args.timeout <= 0:
@@ -1232,7 +1505,7 @@ def main():
 
     # ---------- 批量模式 ----------
     if args.file:
-        targets, parse_errors = load_targets(args.file)
+        targets, parse_errors = load_targets(args.file, args.domain)
         if parse_errors:
             out(f"[格式错误] 共 {len(parse_errors)} 条，已跳过：")
             for e in parse_errors:
@@ -1246,9 +1519,9 @@ def main():
         out(f"共 {len(targets)} 条有效条目待检测（并发 {concurrency}，超时 {args.timeout}s，"
             f"硬超时 {hard_timeout:.0f}s"
             + (f"，总时限 {fmt_dur(args.max_time)}" if args.max_time else "") + "）：")
-        out(f"网络：{net_desc(args)}；引擎：{'requests' if HAS_REQUESTS else 'urllib'}")
+        out(f"网络：{net_desc(args)}；引擎：{'urllib(跳过证书校验)' if args.insecure else ('requests' if HAS_REQUESTS else 'urllib')}")
 
-        n_success = n_fail = n_error = n_captcha = 0
+        n_success = n_captcha = 0
         done = 0
         success_list = []
         captcha_list = []
@@ -1258,19 +1531,17 @@ def main():
         pwd_map = {i: pwd for i, (_, _, pwd) in enumerate(targets, 1)}
 
         def emit(idx, url, username, label, reason, detail):
-            nonlocal done, n_success, n_fail, n_error, n_captcha
+            nonlocal done, n_success, n_captcha
             with print_lock:
                 done += 1
+                # 成功 → 成功文档；验证码（需验证码的站点失败）→ 复核文档；
+                # 失败/异常（不需要验证码）→ 直接丢弃，不落盘、不计数。
                 if label == "成功":
                     n_success += 1
                     success_list.append((idx, url, username, pwd_map.get(idx, "")))
                 elif label == "验证码":
                     n_captcha += 1
                     captcha_list.append((idx, url, username, pwd_map.get(idx, "")))
-                elif label == "失败":
-                    n_fail += 1
-                else:
-                    n_error += 1
                 out(f"[{done}/{len(targets)}] {label} | {url} | {username} | {reason}")
                 if args.verbose and detail:
                     for ln in detail.splitlines():
@@ -1279,13 +1550,13 @@ def main():
                     el = time.monotonic() - t_start
                     eta = el / done * (len(targets) - done)
                     out(f"  -- 进度 {done}/{len(targets)} ({done/len(targets):.1%}) | "
-                        f"成功 {n_success} 失败 {n_fail} 异常 {n_error} 验证码 {n_captcha} | "
+                        f"成功 {n_success} 复核 {n_captcha} | "
                         f"已用 {fmt_dur(el)} 预计剩余 {fmt_dur(eta)}")
 
         def summary():
             out()
             out("-" * 60)
-            out(f"汇总：成功 {n_success} / 失败 {n_fail} / 异常 {n_error} / 验证码 {n_captcha} / 共 {len(targets)}"
+            out(f"汇总：成功 {n_success} / 复核 {n_captcha} / 共 {len(targets)}"
                 f"（实际完成 {done} 条，用时 {fmt_dur(time.monotonic() - t_start)}）")
             success_list.sort(key=lambda x: x[0])
             if success_list:
@@ -1300,11 +1571,11 @@ def main():
                     out(f"已按根域名写出 {len(written)} 份成功结果文档：")
                     for p in written:
                         out(f"  {p}")
-            # 验证码/二次验证 → 单独输出到「需人工复核」文档，绝不与成功清单混在一起
+            # 验证码（需验证码的站点失败）→ 归入「复核」文档；失败/异常（无验证码）已丢弃
             captcha_list.sort(key=lambda x: x[0])
             if captcha_list:
                 out()
-                out(f"验证码清单（{len(captcha_list)} 条，需人工复核，格式 url:username:password）：")
+                out(f"验证码/复核清单（{len(captcha_list)} 条，需人工复核，格式 url:username:password）：")
                 for _, url, username, password in captcha_list:
                     out(f"{url}:{username}:{password}")
                 written = write_captcha_files(captcha_list, args.output_dir, _script_dir)
@@ -1313,11 +1584,6 @@ def main():
                     out(f"已按根域名写出 {len(written)} 份验证码复核文档（<域名>_captcha.txt）：")
                     for p in written:
                         out(f"  {p}")
-            if n_error:
-                out()
-                out(f"提示：{n_error} 条判为「异常」（无明确成功/失败证据）。这类站点通常需要"
-                    f"验证码、加密密码或短信二次验证，脚本无法自动登录；对重点站点建议单独用 "
-                    f"-v --check-contains '登录后页面特征文字' 复核。")
 
         with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="chk") as ex:
             futures = [ex.submit(run_one_hard, item, args, hard_timeout)
@@ -1341,7 +1607,7 @@ def main():
                 os._exit(1)
 
         summary()
-        return 0 if n_fail == 0 and n_error == 0 else 1
+        return 0 if n_captcha == 0 else 1
 
     # ---------- 单条模式 ----------
     if not args.url or not args.username:
